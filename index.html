@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Cannon Vs Store - UE Mesh Swap</title>
+    <title>Cannon Vs Store - Full Shatter (Optimized)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Inter', sans-serif; touch-action: none; }
@@ -16,7 +16,7 @@
     </style>
 </head>
 <body>
-    <div id="loading">Loading Physics Engine & Mesh Swap System...</div>
+    <div id="loading">Loading Physics Engine & Optimization System...</div>
     
     <div id="ui-layer">
         <div class="ui-element text-center md:text-left">
@@ -24,7 +24,7 @@
                 CANNON <span class="text-yellow-400">VS</span> STORE
             </h1>
             <p class="text-white text-lg mt-2 drop-shadow-[0_2px_2px_rgba(0,0,0,0.8)]">
-                Industrial Mesh-Swap Destruction!
+                Full Destruction: Collision Masking Enabled
             </p>
         </div>
         <div class="ui-element flex justify-center pb-8">
@@ -48,7 +48,13 @@
         let isSimulating = false;
         let gameStartTime = 0; 
         
-        // 全局建筑坐标基准
+        // 物理碰撞分组层级
+        const COL_DEFAULT = 1; // 地面、炮弹、完整墙面
+        const COL_SHARD = 2;   // 生成的碎片
+
+        // 材质实例化缓存池，拒绝运行时 new Material
+        let matCache = {};
+
         const storeZ = -60;
 
         function initThree() {
@@ -57,7 +63,7 @@
             scene.fog = new THREE.FogExp2(0x87CEEB, 0.002);
             camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 2000);
             camera.position.set(90, 60, 90);
-            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.shadowMap.enabled = true;
             renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -66,6 +72,16 @@
             controls.enableDamping = true;
             controls.dampingFactor = 0.05;
             controls.maxPolarAngle = Math.PI / 2 - 0.01;
+
+            // 预加载所有材质
+            matCache = {
+                white: new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.8, metalness: 0.1}),
+                glass: new THREE.MeshStandardMaterial({color: 0x88ccff, roughness: 0.1, metalness: 0.9, transparent: true, opacity: 0.6, flatShading: true}),
+                roof: new THREE.MeshStandardMaterial({color: 0xdddddd, roughness: 0.8, metalness: 0.1}),
+                cannonBase: new THREE.MeshStandardMaterial({color: 0x333333}),
+                cannonBarrel: new THREE.MeshStandardMaterial({color: 0x111111, metalness: 0.8, roughness: 0.2}),
+                projectile: new THREE.MeshStandardMaterial({color: 0x222222, metalness: 0.9, roughness: 0.1})
+            };
         }
 
         function initLights() {
@@ -77,7 +93,8 @@
             dirLight.shadow.camera.left = -d; dirLight.shadow.camera.right = d;
             dirLight.shadow.camera.top = d; dirLight.shadow.camera.bottom = -d * 2;
             dirLight.shadow.camera.far = 1000;
-            dirLight.shadow.mapSize.width = 2048; dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.mapSize.width = 1024; 
+            dirLight.shadow.mapSize.height = 1024;
             scene.add(dirLight);
         }
 
@@ -85,7 +102,7 @@
             world = new CANNON.World();
             world.gravity.set(0, -90, 0);
             world.broadphase = new CANNON.SAPBroadphase(world);
-            world.solver.iterations = 15; 
+            world.solver.iterations = 10; 
             world.solver.tolerance = 0.01; 
             
             const physicsMaterial = new CANNON.Material("standard");
@@ -95,6 +112,10 @@
             const groundBody = new CANNON.Body({ mass: 0, material: physicsMaterial });
             groundBody.addShape(new CANNON.Plane());
             groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+            
+            // 地面：与所有物体碰撞
+            groundBody.collisionFilterGroup = COL_DEFAULT;
+            groundBody.collisionFilterMask = COL_DEFAULT | COL_SHARD; 
             world.addBody(groundBody);
             
             const groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshLambertMaterial({ color: 0x333333 }));
@@ -120,7 +141,6 @@
             const geom = new THREE.ConvexGeometry(points);
             const { vertices: uniquePoints, indices } = getIndexedGeometry(geom);
             const frontPoints = [], backPoints = [], vertexSide = []; 
-            
             for(let i = 0; i < uniquePoints.length; i++){
                 const dist = plane.distanceToPoint(uniquePoints[i]);
                 vertexSide.push(dist);
@@ -128,7 +148,6 @@
                 else if(dist < -0.001) backPoints.push(uniquePoints[i]);
                 else { frontPoints.push(uniquePoints[i]); backPoints.push(uniquePoints[i]); }
             }
-            
             const edgeMap = new Set();
             for(let i = 0; i < indices.length; i += 3) {
                 const checkEdge = (i1, i2) => {
@@ -147,7 +166,7 @@
             return [frontPoints, backPoints];
         }
 
-        function createConvexBody(points, mass, color, isGlass) {
+        function createConvexBody(points, mass, material) {
             if (!points || points.length < 4) return;
             let geometry;
             try { geometry = new THREE.ConvexGeometry(points); } catch (e) { return; }
@@ -158,10 +177,6 @@
             geometry.boundingBox.getCenter(center);
             geometry.translate(-center.x, -center.y, -center.z);
 
-            const material = new THREE.MeshStandardMaterial({
-                color: color, roughness: isGlass ? 0.1 : 0.8, metalness: isGlass ? 0.9 : 0.1,
-                transparent: isGlass, opacity: isGlass ? 0.7 : 1.0, flatShading: true
-            });
             const mesh = new THREE.Mesh(geometry, material);
             mesh.castShadow = true; mesh.receiveShadow = true; mesh.position.copy(center);
             scene.add(mesh); meshes.push(mesh);
@@ -178,11 +193,16 @@
             const body = new CANNON.Body({ mass: mass });
             body.addShape(shape); body.position.copy(center);
             
-            body.allowSleep = true; body.sleepSpeedLimit = 2.5; body.sleepTimeLimit = 0.05;
+            // 碎片层级隔离：只与默认层（地面/炮弹）碰撞，碎片间完全穿透免算
+            body.collisionFilterGroup = COL_SHARD;
+            body.collisionFilterMask = COL_DEFAULT;
+            
+            body.allowSleep = true; body.sleepSpeedLimit = 3.0; body.sleepTimeLimit = 0.05;
             world.addBody(body); bodies.push(body);
         }
 
         function executeShatter(data) {
+            // 全量 Mesh Swap 置换逻辑
             scene.remove(data.mesh);
             const mIdx = meshes.indexOf(data.mesh);
             if(mIdx > -1) meshes.splice(mIdx, 1);
@@ -192,22 +212,27 @@
             if(bIdx > -1) bodies.splice(bIdx, 1);
 
             const chunkMass = data.mass / data.chunks.length;
-            data.chunks.forEach(chunk => createConvexBody(chunk, chunkMass, data.color, data.isGlass));
+            const targetMat = data.isGlass ? matCache.glass : (data.color === 0xdddddd ? matCache.roof : matCache.white);
+            
+            data.chunks.forEach(chunk => {
+                createConvexBody(chunk, chunkMass, targetMat);
+            });
         }
 
         function fractureBox(w, h, d, center, cuts, mass, color, isGlass) {
             const geometry = new THREE.BoxGeometry(w, h, d);
-            const material = new THREE.MeshStandardMaterial({
-                color: color, roughness: isGlass ? 0.1 : 0.8, metalness: isGlass ? 0.9 : 0.1,
-                transparent: isGlass, opacity: isGlass ? 0.6 : 1.0
-            });
-            const mesh = new THREE.Mesh(geometry, material);
+            const targetMat = isGlass ? matCache.glass : (color === 0xdddddd ? matCache.roof : matCache.white);
+            const mesh = new THREE.Mesh(geometry, targetMat);
             mesh.castShadow = true; mesh.receiveShadow = true; mesh.position.copy(center);
             scene.add(mesh); meshes.push(mesh);
 
             const shape = new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2));
             const body = new CANNON.Body({ mass: mass, position: new CANNON.Vec3(center.x, center.y, center.z) });
             body.addShape(shape);
+            
+            // 完整墙面层级：参与所有碰撞
+            body.collisionFilterGroup = COL_DEFAULT;
+            body.collisionFilterMask = COL_DEFAULT | COL_SHARD; 
             world.addBody(body); bodies.push(body);
 
             const getBoxPts = () => {
@@ -236,8 +261,6 @@
             let hasShattered = false;
             body.addEventListener("collide", (e) => {
                 if (hasShattered) return;
-                
-                // 1.5 秒初始安全锁，过滤初始化抖动
                 if (performance.now() - gameStartTime < 1500) return;
 
                 const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
@@ -249,19 +272,15 @@
         }
 
         function buildCannon() {
-            // 大炮底座
             const baseGeo = new THREE.BoxGeometry(10, 6, 12);
-            const baseMat = new THREE.MeshStandardMaterial({color: 0x333333});
-            const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+            const baseMesh = new THREE.Mesh(baseGeo, matCache.cannonBase);
             baseMesh.position.set(0, 3, 50);
             baseMesh.castShadow = true;
             scene.add(baseMesh);
 
-            // 大炮炮管 (对准便利店方向 Z = -60)
             const barrelGeo = new THREE.CylinderGeometry(2, 3, 20, 16);
-            const barrelMat = new THREE.MeshStandardMaterial({color: 0x111111, metalness: 0.8, roughness: 0.2});
-            const barrelMesh = new THREE.Mesh(barrelGeo, barrelMat);
-            barrelMesh.rotation.x = Math.PI / 2 + 0.1; // 微微上扬
+            const barrelMesh = new THREE.Mesh(barrelGeo, matCache.cannonBarrel);
+            barrelMesh.rotation.x = Math.PI / 2 + 0.1;
             barrelMesh.position.set(0, 8, 42);
             barrelMesh.castShadow = true;
             scene.add(barrelMesh);
@@ -269,25 +288,23 @@
 
         function fireCannon() {
             const radius = 2;
-            const mass = 1500; // 极高密度的实心炮弹
+            const mass = 1500; 
 
-            // 视觉球体
             const geo = new THREE.SphereGeometry(radius, 32, 32);
-            const mat = new THREE.MeshStandardMaterial({color: 0x222222, metalness: 0.9, roughness: 0.1});
-            const mesh = new THREE.Mesh(geo, mat);
+            const mesh = new THREE.Mesh(geo, matCache.projectile);
             mesh.castShadow = true;
             scene.add(mesh);
             meshes.push(mesh);
 
-            // 物理球体刚体
             const shape = new CANNON.Sphere(radius);
             const body = new CANNON.Body({mass: mass});
             body.addShape(shape);
             
-            // 将炮弹生成在炮管末端
+            // 炮弹层级：可击碎完整墙壁与散落碎片
+            body.collisionFilterGroup = COL_DEFAULT;
+            body.collisionFilterMask = COL_DEFAULT | COL_SHARD;
+
             body.position.set(0, 10, 32);
-            
-            // 赋予极高初速，直射便利店
             body.velocity.set(0, 5, -300); 
             
             world.addBody(body);
@@ -306,7 +323,6 @@
 
             fractureBox(storeW + 10, 6, 50, new THREE.Vector3(0, wallH + 3, storeZ), 3, 2000, 0xdddddd, false);
             
-            // 焦点设在便利店与大炮之间
             controls.target.set(0, wallH/3, storeZ + 30);
         }
 
@@ -317,14 +333,13 @@
             document.getElementById('loading').style.display = 'none';
             document.getElementById('push-btn').style.display = 'block';
             
-            // 引擎常驻运行，过滤加载初期的抖动
             gameStartTime = performance.now(); 
             isSimulating = true;
             animate(0);
         };
 
         document.getElementById('push-btn').addEventListener('click', () => {
-            fireCannon(); // 支持连续点击，多发炮弹轰击
+            fireCannon(); 
         });
 
         let lastTime = 0;
