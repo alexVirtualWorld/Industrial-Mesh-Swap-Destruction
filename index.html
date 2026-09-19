@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Cannon Vs Store - UE Mesh Swap</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Inter', sans-serif; touch-action: none; }
+        #game-canvas { display: block; width: 100vw; height: 100vh; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 2rem; box-sizing: border-box; z-index: 10; }
+        .ui-element { pointer-events: auto; }
+        #push-btn { background: linear-gradient(135deg, #ff0055, #880000); box-shadow: 0 10px 25px rgba(255, 0, 85, 0.5); transition: transform 0.1s, box-shadow 0.1s; }
+        #push-btn:active { transform: translateY(5px); box-shadow: 0 5px 15px rgba(255, 0, 85, 0.5); }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 1.5rem; font-weight: bold; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading Physics Engine & Mesh Swap System...</div>
+    
+    <div id="ui-layer">
+        <div class="ui-element text-center md:text-left">
+            <h1 class="text-4xl md:text-6xl font-black text-white drop-shadow-[0_4px_4px_rgba(0,0,0,0.8)] tracking-tight">
+                CANNON <span class="text-yellow-400">VS</span> STORE
+            </h1>
+            <p class="text-white text-lg mt-2 drop-shadow-[0_2px_2px_rgba(0,0,0,0.8)]">
+                Industrial Mesh-Swap Destruction!
+            </p>
+        </div>
+        <div class="ui-element flex justify-center pb-8">
+            <button id="push-btn" class="text-white font-black text-4xl py-4 px-16 rounded-full border-4 border-white uppercase tracking-widest hidden">
+                FIRE!
+            </button>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/math/ConvexHull.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/geometries/ConvexGeometry.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+
+    <script>
+        let scene, camera, renderer, controls, world;
+        const meshes = [];
+        const bodies = [];
+        const pendingShatters = []; 
+        let isSimulating = false;
+        let gameStartTime = 0; 
+        
+        // 全局建筑坐标基准
+        const storeZ = -60;
+
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.FogExp2(0x87CEEB, 0.002);
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 2000);
+            camera.position.set(90, 60, 90);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 - 0.01;
+        }
+
+        function initLights() {
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(100, 200, 50);
+            dirLight.castShadow = true;
+            const d = 250;
+            dirLight.shadow.camera.left = -d; dirLight.shadow.camera.right = d;
+            dirLight.shadow.camera.top = d; dirLight.shadow.camera.bottom = -d * 2;
+            dirLight.shadow.camera.far = 1000;
+            dirLight.shadow.mapSize.width = 2048; dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+        }
+
+        function initCannon() {
+            world = new CANNON.World();
+            world.gravity.set(0, -90, 0);
+            world.broadphase = new CANNON.SAPBroadphase(world);
+            world.solver.iterations = 15; 
+            world.solver.tolerance = 0.01; 
+            
+            const physicsMaterial = new CANNON.Material("standard");
+            const contactMat = new CANNON.ContactMaterial(physicsMaterial, physicsMaterial, { friction: 0.8, restitution: 0.05 });
+            world.addContactMaterial(contactMat);
+            
+            const groundBody = new CANNON.Body({ mass: 0, material: physicsMaterial });
+            groundBody.addShape(new CANNON.Plane());
+            groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+            world.addBody(groundBody);
+            
+            const groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshLambertMaterial({ color: 0x333333 }));
+            groundMesh.rotation.x = -Math.PI / 2;
+            groundMesh.receiveShadow = true;
+            scene.add(groundMesh);
+        }
+
+        function getIndexedGeometry(geom) {
+            const pos = geom.attributes.position;
+            const vertices = []; const indices = []; const map = new Map();
+            let idx = 0;
+            for (let i = 0; i < pos.count; i++) {
+                const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+                const key = `${Math.round(x*1000)}_${Math.round(y*1000)}_${Math.round(z*1000)}`;
+                if (!map.has(key)) { map.set(key, idx); vertices.push(new THREE.Vector3(x, y, z)); idx++; }
+                indices.push(map.get(key));
+            }
+            return { vertices, indices };
+        }
+
+        function splitPoints(points, plane) {
+            const geom = new THREE.ConvexGeometry(points);
+            const { vertices: uniquePoints, indices } = getIndexedGeometry(geom);
+            const frontPoints = [], backPoints = [], vertexSide = []; 
+            
+            for(let i = 0; i < uniquePoints.length; i++){
+                const dist = plane.distanceToPoint(uniquePoints[i]);
+                vertexSide.push(dist);
+                if(dist > 0.001) frontPoints.push(uniquePoints[i]);
+                else if(dist < -0.001) backPoints.push(uniquePoints[i]);
+                else { frontPoints.push(uniquePoints[i]); backPoints.push(uniquePoints[i]); }
+            }
+            
+            const edgeMap = new Set();
+            for(let i = 0; i < indices.length; i += 3) {
+                const checkEdge = (i1, i2) => {
+                    const min = Math.min(i1, i2), max = Math.max(i1, i2), key = min + '_' + max;
+                    if(!edgeMap.has(key)){
+                        edgeMap.add(key);
+                        const d1 = vertexSide[i1], d2 = vertexSide[i2];
+                        if(d1 * d2 < 0) {
+                            const intersect = uniquePoints[i1].clone().lerp(uniquePoints[i2], d1 / (d1 - d2));
+                            frontPoints.push(intersect); backPoints.push(intersect);
+                        }
+                    }
+                };
+                checkEdge(indices[i], indices[i+1]); checkEdge(indices[i+1], indices[i+2]); checkEdge(indices[i+2], indices[i]);
+            }
+            return [frontPoints, backPoints];
+        }
+
+        function createConvexBody(points, mass, color, isGlass) {
+            if (!points || points.length < 4) return;
+            let geometry;
+            try { geometry = new THREE.ConvexGeometry(points); } catch (e) { return; }
+            if (!geometry || !geometry.attributes || !geometry.attributes.position) return; 
+
+            geometry.computeBoundingBox();
+            const center = new THREE.Vector3();
+            geometry.boundingBox.getCenter(center);
+            geometry.translate(-center.x, -center.y, -center.z);
+
+            const material = new THREE.MeshStandardMaterial({
+                color: color, roughness: isGlass ? 0.1 : 0.8, metalness: isGlass ? 0.9 : 0.1,
+                transparent: isGlass, opacity: isGlass ? 0.7 : 1.0, flatShading: true
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.castShadow = true; mesh.receiveShadow = true; mesh.position.copy(center);
+            scene.add(mesh); meshes.push(mesh);
+
+            const { vertices: uniquePts, indices } = getIndexedGeometry(geometry);
+            const shrinkFactor = 0.95; 
+            const cannonPts = uniquePts.map(p => new CANNON.Vec3(p.x * shrinkFactor, p.y * shrinkFactor, p.z * shrinkFactor));
+            const faces = [];
+            for (let i = 0; i < indices.length; i += 3) faces.push([indices[i], indices[i+1], indices[i+2]]);
+
+            let shape;
+            try { shape = new CANNON.ConvexPolyhedron(cannonPts, faces); } catch (e) { scene.remove(mesh); return; }
+            
+            const body = new CANNON.Body({ mass: mass });
+            body.addShape(shape); body.position.copy(center);
+            
+            body.allowSleep = true; body.sleepSpeedLimit = 2.5; body.sleepTimeLimit = 0.05;
+            world.addBody(body); bodies.push(body);
+        }
+
+        function executeShatter(data) {
+            scene.remove(data.mesh);
+            const mIdx = meshes.indexOf(data.mesh);
+            if(mIdx > -1) meshes.splice(mIdx, 1);
+
+            world.remove(data.body);
+            const bIdx = bodies.indexOf(data.body);
+            if(bIdx > -1) bodies.splice(bIdx, 1);
+
+            const chunkMass = data.mass / data.chunks.length;
+            data.chunks.forEach(chunk => createConvexBody(chunk, chunkMass, data.color, data.isGlass));
+        }
+
+        function fractureBox(w, h, d, center, cuts, mass, color, isGlass) {
+            const geometry = new THREE.BoxGeometry(w, h, d);
+            const material = new THREE.MeshStandardMaterial({
+                color: color, roughness: isGlass ? 0.1 : 0.8, metalness: isGlass ? 0.9 : 0.1,
+                transparent: isGlass, opacity: isGlass ? 0.6 : 1.0
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.castShadow = true; mesh.receiveShadow = true; mesh.position.copy(center);
+            scene.add(mesh); meshes.push(mesh);
+
+            const shape = new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2));
+            const body = new CANNON.Body({ mass: mass, position: new CANNON.Vec3(center.x, center.y, center.z) });
+            body.addShape(shape);
+            world.addBody(body); bodies.push(body);
+
+            const getBoxPts = () => {
+                const pts = [];
+                for(let x=-1; x<=1; x+=2) for(let y=-1; y<=1; y+=2) for(let z=-1; z<=1; z+=2)
+                    pts.push(new THREE.Vector3(center.x + x*w/2, center.y + y*h/2, center.z + z*d/2));
+                return pts;
+            };
+
+            let chunks = [getBoxPts()];
+            for(let i=0; i<cuts; i++) {
+                const newChunks = [];
+                chunks.forEach(chunk => {
+                    const chunkCenter = new THREE.Box3().setFromPoints(chunk).getCenter(new THREE.Vector3());
+                    const normal = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+                    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, chunkCenter);
+                    try {
+                        const [front, back] = splitPoints(chunk, plane);
+                        if(front.length >= 4 && back.length >= 4) newChunks.push(front, back);
+                        else newChunks.push(chunk);
+                    } catch(e) { newChunks.push(chunk); }
+                });
+                chunks = newChunks;
+            }
+
+            let hasShattered = false;
+            body.addEventListener("collide", (e) => {
+                if (hasShattered) return;
+                
+                // 1.5 秒初始安全锁，过滤初始化抖动
+                if (performance.now() - gameStartTime < 1500) return;
+
+                const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
+                if (impact > 3.0) {
+                    hasShattered = true;
+                    pendingShatters.push({ mesh, body, chunks, mass, color, isGlass });
+                }
+            });
+        }
+
+        function buildCannon() {
+            // 大炮底座
+            const baseGeo = new THREE.BoxGeometry(10, 6, 12);
+            const baseMat = new THREE.MeshStandardMaterial({color: 0x333333});
+            const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+            baseMesh.position.set(0, 3, 50);
+            baseMesh.castShadow = true;
+            scene.add(baseMesh);
+
+            // 大炮炮管 (对准便利店方向 Z = -60)
+            const barrelGeo = new THREE.CylinderGeometry(2, 3, 20, 16);
+            const barrelMat = new THREE.MeshStandardMaterial({color: 0x111111, metalness: 0.8, roughness: 0.2});
+            const barrelMesh = new THREE.Mesh(barrelGeo, barrelMat);
+            barrelMesh.rotation.x = Math.PI / 2 + 0.1; // 微微上扬
+            barrelMesh.position.set(0, 8, 42);
+            barrelMesh.castShadow = true;
+            scene.add(barrelMesh);
+        }
+
+        function fireCannon() {
+            const radius = 2;
+            const mass = 1500; // 极高密度的实心炮弹
+
+            // 视觉球体
+            const geo = new THREE.SphereGeometry(radius, 32, 32);
+            const mat = new THREE.MeshStandardMaterial({color: 0x222222, metalness: 0.9, roughness: 0.1});
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.castShadow = true;
+            scene.add(mesh);
+            meshes.push(mesh);
+
+            // 物理球体刚体
+            const shape = new CANNON.Sphere(radius);
+            const body = new CANNON.Body({mass: mass});
+            body.addShape(shape);
+            
+            // 将炮弹生成在炮管末端
+            body.position.set(0, 10, 32);
+            
+            // 赋予极高初速，直射便利店
+            body.velocity.set(0, 5, -300); 
+            
+            world.addBody(body);
+            bodies.push(body);
+        }
+
+        function buildStore() {
+            const storeW = 60, wallH = 36;
+            
+            fractureBox(4, wallH, 40, new THREE.Vector3(-storeW/2, wallH/2, storeZ), 4, 800, 0xffffff, false);
+            fractureBox(4, wallH, 40, new THREE.Vector3(storeW/2, wallH/2, storeZ), 4, 800, 0xffffff, false);
+            fractureBox(storeW, wallH, 4, new THREE.Vector3(0, wallH/2, storeZ - 20), 5, 1200, 0xffffff, false);
+            
+            fractureBox(storeW * 0.35, wallH * 0.8, 2, new THREE.Vector3(-storeW * 0.28, wallH * 0.4, storeZ + 20), 5, 300, 0x88ccff, true);
+            fractureBox(storeW * 0.35, wallH * 0.8, 2, new THREE.Vector3(storeW * 0.28, wallH * 0.4, storeZ + 20), 5, 300, 0x88ccff, true);
+
+            fractureBox(storeW + 10, 6, 50, new THREE.Vector3(0, wallH + 3, storeZ), 3, 2000, 0xdddddd, false);
+            
+            // 焦点设在便利店与大炮之间
+            controls.target.set(0, wallH/3, storeZ + 30);
+        }
+
+        window.onload = function() {
+            initThree(); initLights(); initCannon();
+            buildCannon(); buildStore();
+            
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('push-btn').style.display = 'block';
+            
+            // 引擎常驻运行，过滤加载初期的抖动
+            gameStartTime = performance.now(); 
+            isSimulating = true;
+            animate(0);
+        };
+
+        document.getElementById('push-btn').addEventListener('click', () => {
+            fireCannon(); // 支持连续点击，多发炮弹轰击
+        });
+
+        let lastTime = 0;
+        const fixedTimeStep = 1 / 60;
+        
+        function animate(time) {
+            requestAnimationFrame(animate);
+            if (isSimulating) {
+                if (lastTime !== 0) {
+                    const deltaTime = (time - lastTime) / 1000;
+                    world.step(fixedTimeStep, deltaTime, 3);
+                }
+                lastTime = time;
+
+                while (pendingShatters.length > 0) {
+                    executeShatter(pendingShatters.pop());
+                }
+
+                for (let i = 0; i < meshes.length; i++) {
+                    if (bodies[i]) {
+                        meshes[i].position.copy(bodies[i].position);
+                        meshes[i].quaternion.copy(bodies[i].quaternion);
+                    }
+                }
+            }
+            controls.update(); renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
